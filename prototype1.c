@@ -1,4 +1,3 @@
-```c
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -8,6 +7,7 @@
 #define AUDIO_BASE      0xFF203040
 #define SAMPLE_RATE     8000
 
+// ================= STRUCTS =================
 typedef struct {
     volatile unsigned int CONTROL;
     volatile unsigned int FIFOSPACE;
@@ -27,28 +27,50 @@ typedef struct {
 } HCSR04_t;
 
 typedef struct {
-    GPIO_t *gpio;
-    int pin;
-} VIBRATION_t;
+    int last_state;
+    int tap_count;
+    int timer;
+    int event; // 1 = single, 3 = triple
+} TapState;
 
-AUDIO_t *audio  = (AUDIO_t *)AUDIO_BASE;
+typedef struct {
+    int frequency;
+    int volume;
+    int total_samples;
+    int sample_index;
+    int half_period;
+    int counter;
+    int is_high;
+    int active;
+} AudioState;
+
+typedef enum {
+    MODE_NORMAL,
+    MODE_ASSIST
+} SystemMode;
+
+// ================= GLOBALS =================
+AUDIO_t *audio = (AUDIO_t *)AUDIO_BASE;
 volatile int *hex   = (int *)HEX3_HEX0_BASE;
 volatile int *hex54 = (int *)HEX5_HEX4_BASE;
 
+AudioState audio_state = {0};
+
+// ================= SEG7 =================
 const unsigned char seg7[] = {
-    0x3F, 0x06, 0x5B, 0x4F, 0x66,
-    0x6D, 0x7D, 0x07, 0x7F, 0x6F
+    0x3F,0x06,0x5B,0x4F,0x66,
+    0x6D,0x7D,0x07,0x7F,0x6F
 };
 
-// GPIO FUNCTIONS
+// ================= GPIO =================
 void pinMode(GPIO_t *gpio, int pin, int mode) {
-    if(mode == 1) gpio->DDR |=  (1 << pin);
-    else          gpio->DDR &= ~(1 << pin);
+    if(mode) gpio->DDR |= (1 << pin);
+    else     gpio->DDR &= ~(1 << pin);
 }
 
 void digitalWrite(GPIO_t *gpio, int pin, int val) {
-    if(val != 0) gpio->DATA |=  (1 << pin);
-    else         gpio->DATA &= ~(1 << pin);
+    if(val) gpio->DATA |= (1 << pin);
+    else    gpio->DATA &= ~(1 << pin);
 }
 
 int digitalRead(GPIO_t *gpio, int pin) {
@@ -60,248 +82,226 @@ void delay(int us) {
     for(i = 0; i < us * 40; i++);
 }
 
-// HEX DISPLAY
+// ================= DISPLAY =================
 void display_distance1(float d1) {
-    int s1 = (int)d1;
-    if(s1 > 999) s1 = 999;
-    if(s1 < 0)   s1 = 0;
+    int s = (int)d1;
+    if(s < 0) s = 0;
+    if(s > 999) s = 999;
 
-    // HEX5=hundreds, HEX4=tens
-    *hex54 = (seg7[(s1/100)%10] << 8) | seg7[(s1/10)%10];
-    // HEX3=units, keep HEX2-HEX0 unchanged
-    *hex = (*hex & 0x00FFFFFF) | (seg7[s1%10] << 24);
+    *hex54 = (seg7[(s/100)%10] << 8) | seg7[(s/10)%10];
+    *hex = (*hex & 0x00FFFFFF) | (seg7[s%10] << 24);
 }
 
 void display_distance2(float d2) {
-    int s2 = (int)d2;
-    if(s2 > 999) s2 = 999;
-    if(s2 < 0)   s2 = 0;
+    int s = (int)d2;
+    if(s < 0) s = 0;
+    if(s > 999) s = 999;
 
-    // HEX2=hundreds, HEX1=tens, HEX0=units, keep HEX3 unchanged
     *hex = (*hex & 0xFF000000) |
-           (seg7[(s2/100)%10] << 16) |
-           (seg7[(s2/10)%10]  <<  8) |
-            seg7[s2%10];
+           (seg7[(s/100)%10] << 16) |
+           (seg7[(s/10)%10] << 8) |
+           seg7[s%10];
 }
 
 void show_assist() {
-    *hex54 = 0x00000000;
-    *hex   = (0x77 << 24) | (0x6D << 16) | (0x6D << 8) | 0x78;
+    *hex54 = 0;
+    *hex = (0x77<<24)|(0x6D<<16)|(0x6D<<8)|0x78;
 }
 
 void show_disengage() {
-    *hex54 = 0x00000000;
-    *hex   = (0x5E << 24) | (0x06 << 16) | (0x6D << 8) | 0x79;
+    *hex54 = 0;
+    *hex = (0x5E<<24)|(0x06<<16)|(0x6D<<8)|0x79;
 }
 
-// SENSOR FUNCTIONS
-void trigger(HCSR04_t *sensor) {
-    digitalWrite(sensor->gpio, sensor->trig_pin, 0);
+// ================= SENSOR =================
+void trigger(HCSR04_t *s) {
+    digitalWrite(s->gpio, s->trig_pin, 0);
     delay(2);
-    digitalWrite(sensor->gpio, sensor->trig_pin, 1);
+    digitalWrite(s->gpio, s->trig_pin, 1);
     delay(15);
-    digitalWrite(sensor->gpio, sensor->trig_pin, 0);
+    digitalWrite(s->gpio, s->trig_pin, 0);
 }
 
-float distance(HCSR04_t *sensor) {
-    trigger(sensor);
-    int timeout = 1000000;
-    while(digitalRead(sensor->gpio, sensor->echo_pin) == 0 && timeout > 0) timeout--;
-    if(timeout <= 0) return -1.0;
-    volatile int count = 0;
-    while(digitalRead(sensor->gpio, sensor->echo_pin) == 1) count++;
+float distance(HCSR04_t *s) {
+    trigger(s);
+
+    int timeout = 100000;
+    while(!digitalRead(s->gpio, s->echo_pin) && timeout--);
+    if(timeout <= 0) return -1;
+
+    int count = 0;
+    while(digitalRead(s->gpio, s->echo_pin)) count++;
+
     return (float)count / 150.0;
 }
 
-// AUDIO FUNCTIONS
+// ================= AUDIO =================
 bool FIFOspace() {
-    unsigned int fifospace = audio->FIFOSPACE;
-    unsigned int wslc = (fifospace & 0xFF000000) >> 24;
-    unsigned int wsrc = (fifospace & 0x00FF0000) >> 16;
-    return (wslc > 0 && wsrc > 0);
+    unsigned int f = audio->FIFOSPACE;
+    return ((f>>24)&0xFF) && ((f>>16)&0xFF);
 }
 
-void play_sample(int sample) {
-    while(!FIFOspace());
-    audio->LEFTDATA  = sample;
+void startTone(int freq, int duration_ms, int volume) {
+    audio_state.frequency = freq;
+    audio_state.volume = volume;
+    audio_state.sample_index = 0;
+    audio_state.total_samples = (SAMPLE_RATE * duration_ms)/1000;
+    audio_state.half_period = (freq==0)?1:SAMPLE_RATE/freq/2;
+    audio_state.counter = 0;
+    audio_state.is_high = 1;
+    audio_state.active = 1;
+}
+
+void updateAudio() {
+    if(!audio_state.active) return;
+    if(!FIFOspace()) return;
+
+    int sample = 0;
+
+    if(audio_state.frequency != 0) {
+        sample = audio_state.is_high ? audio_state.volume : -audio_state.volume;
+
+        if(++audio_state.counter >= audio_state.half_period) {
+            audio_state.counter = 0;
+            audio_state.is_high ^= 1;
+        }
+    }
+
+    audio->LEFTDATA = sample;
     audio->RIGHTDATA = sample;
+
+    if(++audio_state.sample_index >= audio_state.total_samples)
+        audio_state.active = 0;
 }
 
-void play_tone(int frequency, int duration_ms, int VOLUME) {
-    if(frequency == 0) {
-        int total_samples = (SAMPLE_RATE * duration_ms) / 1000;
-        for(int i = 0; i < total_samples; i++) play_sample(0);
-        return;
+// ================= TAP FSM =================
+void updateTap(TapState *t, GPIO_t *gpio, int pin) {
+    int curr = digitalRead(gpio, pin);
+
+    if(curr && !t->last_state) {
+        t->tap_count++;
+        t->timer = 0;
     }
-    int half_period_samples = SAMPLE_RATE / frequency / 2;
-    int total_samples = (SAMPLE_RATE * duration_ms) / 1000;
-    int sample_count = 0;
-    bool is_high = true;
-    for(int i = 0; i < total_samples; i++) {
-        play_sample(is_high ? VOLUME : -VOLUME);
-        sample_count++;
-        if(sample_count >= half_period_samples) {
-            is_high = !is_high;
-            sample_count = 0;
+
+    t->last_state = curr;
+
+    if(t->tap_count > 0) {
+        t->timer++;
+
+        if(t->timer > 4000) {
+            if(t->tap_count == 1) t->event = 1;
+            else if(t->tap_count >= 3) t->event = 3;
+
+            t->tap_count = 0;
+            t->timer = 0;
         }
     }
 }
 
-void play_obstacle_alert(int VOLUME) {
-    play_tone(1000, 100, VOLUME);
-    play_tone(0, 100, VOLUME);
+// ================= FALL DETECTION =================
+bool detectFall(float d1, float d2, float p1, float p2) {
+    float c1 = d1 - p1;
+    float c2 = d2 - p2;
+
+    if(c1 < 0) c1 = -c1;
+    if(c2 < 0) c2 = -c2;
+
+    return (c1 > 20.0 || c2 > 20.0);
 }
 
-void play_ledge_alert(int VOLUME) {
-    play_tone(300, 400, VOLUME);
-    play_tone(0, 100, VOLUME);
-}
-
-void play_emergency_siren(int VOLUME) {
-    play_tone(600, 300, VOLUME);
-    play_tone(800, 300, VOLUME);
-}
-
-// VIBRATION FUNCTIONS
-int vibrationRead(VIBRATION_t *vib) {
-    return digitalRead(vib->gpio, vib->pin);
-}
-
-int countTaps(GPIO_t *gpio, int pin) {
-    int count = 1;
-    int timeout = 0;
-
-    while(digitalRead(gpio, pin));
-    delay(10000);
-
-    while(timeout < 8000) {
-        if(digitalRead(gpio, pin)) {
-            count++;
-            while(digitalRead(gpio, pin));
-            delay(10000);
-            timeout = 0;
-        }
-        delay(100);
-        timeout++;
-    }
-    return count;
-}
-
-// FALL DETECTION
-bool detectFall(float curr_d1, float curr_d2,
-                float prev_d1, float prev_d2) {
-    float change1 = curr_d1 - prev_d1;
-    float change2 = curr_d2 - prev_d2;
-
-    if(change1 < 0) change1 = -change1;
-    if(change2 < 0) change2 = -change2;
-
-    return (change1 > 20.0 || change2 > 20.0);
-}
-
-int main(void) {
+// ================= MAIN =================
+int main() {
     audio->CONTROL = 0xC;
     audio->CONTROL = 0x0;
 
-    unsigned int volume = 0;
-    int assist_mode = 0;
-    int idle_count  = 0;
-    float prev_d1   = 0.0;
-    float prev_d2   = 0.0;
-
     GPIO_t *jp2 = (GPIO_t *)JP2_BASE;
 
-    // sensor 1: pin 8 trig (bit5), pin 9 echo (bit6)
-    HCSR04_t sensor1 = { jp2, 5, 6 };
-    pinMode(sensor1.gpio, sensor1.trig_pin, 1);
-    pinMode(sensor1.gpio, sensor1.echo_pin, 0);
+    HCSR04_t s1 = {jp2,5,6};
+    HCSR04_t s2 = {jp2,3,4};
 
-    // sensor 2: pin 6 trig (bit3), pin 7 echo (bit4)
-    HCSR04_t sensor2 = { jp2, 3, 4 };
-    pinMode(sensor2.gpio, sensor2.trig_pin, 1);
-    pinMode(sensor2.gpio, sensor2.echo_pin, 0);
+    pinMode(jp2,5,1);
+    pinMode(jp2,6,0);
+    pinMode(jp2,3,1);
+    pinMode(jp2,4,0);
+    pinMode(jp2,2,0); // vibration
 
-    // vibration: pin 5 (bit2)
-    VIBRATION_t vib = { jp2, 2 };
-    pinMode(vib.gpio, vib.pin, 0);
+    TapState tap = {0};
+    SystemMode mode = MODE_NORMAL;
 
-    *hex   = 0x00000000;
-    *hex54 = 0x00000000;
+    float d1=0,d2=0,prev1=0,prev2=0;
+    int sensor_timer = 0;
+    int idle_counter = 0;
 
     while(1) {
-        float dist1 = distance(&sensor1);
-        delay(60000);
-        float dist2 = distance(&sensor2);
-        delay(60000);
 
-        // --- VIBRATION CHECK ---
-        if(vibrationRead(&vib)) {
-            if(detectFall(dist1, dist2, prev_d1, prev_d2)) {
-                assist_mode = 1;
+        // --- ALWAYS RUN ---
+        updateTap(&tap, jp2, 2);
+        updateAudio();
+
+        // --- SENSOR UPDATE ---
+        if(++sensor_timer > 20000) {
+            d1 = distance(&s1);
+            d2 = distance(&s2);
+            sensor_timer = 0;
+        }
+
+        // --- TAP EVENTS ---
+        if(tap.event == 1) {
+            if(mode == MODE_NORMAL) {
+                mode = MODE_ASSIST;
                 show_assist();
-                play_emergency_siren(0x3FFFFFFF);
-            } else {
-                int taps = countTaps(jp2, 2);
+                startTone(800,300,0x3FFFFFFF);
+            }
+            tap.event = 0;
+        }
 
-                if(taps == 1 && !assist_mode) {
-                    assist_mode = 1;
-                    show_assist();
-                    play_emergency_siren(0x3FFFFFFF);
-                }
-                else if(taps >= 3 && assist_mode) {
-                    assist_mode = 0;
-                    show_disengage();
-                    delay(1000000);
-                    *hex   = 0x00000000;
-                    *hex54 = 0x00000000;
-                }
+        if(tap.event == 3) {
+            if(mode == MODE_ASSIST) {
+                mode = MODE_NORMAL;
+                show_disengage();
+            }
+            tap.event = 0;
+        }
+
+        // --- FALL DETECTION ---
+        if(mode == MODE_NORMAL) {
+            if(detectFall(d1,d2,prev1,prev2)) {
+                mode = MODE_ASSIST;
+                show_assist();
+                startTone(600,500,0x3FFFFFFF);
             }
         }
 
-        // --- SLOW FALL DETECTION ---
-        float change1 = dist1 - prev_d1;
-        float change2 = dist2 - prev_d2;
-        if(change1 < 0) change1 = -change1;
-        if(change2 < 0) change2 = -change2;
+        // --- SLOW FALL ---
+        float c1 = d1 - prev1;
+        float c2 = d2 - prev2;
+        if(c1<0) c1=-c1;
+        if(c2<0) c2=-c2;
 
-        if(change1 < 2.0 && change2 < 2.0) {
-            idle_count++;
-        } else {
-            idle_count = 0;
-        }
+        if(c1<2 && c2<2) idle_counter++;
+        else idle_counter=0;
 
-        if(idle_count >= 50 && !assist_mode) {
-            assist_mode = 1;
+        if(idle_counter > 50 && mode == MODE_NORMAL) {
+            mode = MODE_ASSIST;
             show_assist();
-            play_emergency_siren(0x3FFFFFFF);
-            idle_count = 0;
+            startTone(600,500,0x3FFFFFFF);
+            idle_counter = 0;
         }
 
-        prev_d1 = dist1;
-        prev_d2 = dist2;
+        prev1 = d1;
+        prev2 = d2;
 
-        // --- SENSOR LOGIC ---
-        if(!assist_mode) {
-            // obstacle detection sensor 1
-            if(dist1 > 0 && dist1 <= 30) {
-                if(dist1 > 20)      volume = 0x3FFFFFFF / 4;
-                else if(dist1 > 10) volume = 0x3FFFFFFF / 2;
-                else                volume = 0x3FFFFFFF;
-                play_obstacle_alert(volume);
-            }
+        // --- NORMAL MODE ---
+        if(mode == MODE_NORMAL) {
 
-            // ledge detection sensor 2
-            if(dist2 >= 18.0)      play_emergency_siren(0x3FFFFFFF);
-            else if(dist2 >= 10.0) play_ledge_alert(0x3FFFFFFF);
-            else if(dist2 >= 5.0)  play_ledge_alert(0x3FFFFFFF / 2);
-            else if(dist2 >= 3.0)  play_ledge_alert(0x3FFFFFFF / 4);
+            if(d1>0 && d1<=30 && !audio_state.active)
+                startTone(1000,100,0x3FFFFFFF);
 
-            // show both distances on HEX
-            display_distance1(dist1);
-            display_distance2(dist2);
+            if(d2>=18 && !audio_state.active)
+                startTone(600,300,0x3FFFFFFF);
+
+            display_distance1(d1);
+            display_distance2(d2);
         }
     }
-
-    return 0;
 }
-```
