@@ -1,3 +1,4 @@
+```c
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -60,23 +61,27 @@ void delay(int us) {
 }
 
 // HEX DISPLAY
-void display_distances(float d1, float d2) {
+void display_distance1(float d1) {
     int s1 = (int)d1;
-    int s2 = (int)d2;
-
-    if(s1 > 99)  s1 = 99;
-    if(s2 > 999) s2 = 999;
+    if(s1 > 999) s1 = 999;
     if(s1 < 0)   s1 = 0;
+
+    // HEX5=hundreds, HEX4=tens
+    *hex54 = (seg7[(s1/100)%10] << 8) | seg7[(s1/10)%10];
+    // HEX3=units, keep HEX2-HEX0 unchanged
+    *hex = (*hex & 0x00FFFFFF) | (seg7[s1%10] << 24);
+}
+
+void display_distance2(float d2) {
+    int s2 = (int)d2;
+    if(s2 > 999) s2 = 999;
     if(s2 < 0)   s2 = 0;
 
-    // sensor 1 on HEX5-HEX4 (2 digits)
-    *hex54 = (seg7[(s1/10)%10] << 8) | seg7[s1%10];
-
-    // sensor 2 on HEX2-HEX1-HEX0 (3 digits), HEX3 blank
-    *hex = (0x00 << 24) |
+    // HEX2=hundreds, HEX1=tens, HEX0=units, keep HEX3 unchanged
+    *hex = (*hex & 0xFF000000) |
            (seg7[(s2/100)%10] << 16) |
-           (seg7[(s2/10) %10] <<  8) |
-            seg7[ s2     %10];
+           (seg7[(s2/10)%10]  <<  8) |
+            seg7[s2%10];
 }
 
 void show_assist() {
@@ -291,10 +296,12 @@ int main(void) {
             else if(dist2 >= 5.0)  play_ledge_alert(0x3FFFFFFF / 2);
             else if(dist2 >= 3.0)  play_ledge_alert(0x3FFFFFFF / 4);
 
-            // show distances on HEX
-            display_distances(dist1, dist2);
+            // show both distances on HEX
+            display_distance1(dist1);
+            display_distance2(dist2);
         }
     }
 
     return 0;
 }
+```
