@@ -1,3 +1,4 @@
+```c
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -39,7 +40,7 @@ const unsigned char seg7[] = {
     0x6D, 0x7D, 0x07, 0x7F, 0x6F
 };
 
-// --- GPIO FUNCTIONS ---
+// GPIO FUNCTIONS
 void pinMode(GPIO_t *gpio, int pin, int mode) {
     if(mode == 1) gpio->DDR |=  (1 << pin);
     else          gpio->DDR &= ~(1 << pin);
@@ -59,12 +60,15 @@ void delay(int us) {
     for(i = 0; i < us * 40; i++);
 }
 
-// --- HEX DISPLAY ---
+// HEX DISPLAY
 void display_distance1(float d1) {
     int s1 = (int)d1;
     if(s1 > 999) s1 = 999;
     if(s1 < 0)   s1 = 0;
+
+    // HEX5=hundreds, HEX4=tens
     *hex54 = (seg7[(s1/100)%10] << 8) | seg7[(s1/10)%10];
+    // HEX3=units, keep HEX2-HEX0 unchanged
     *hex = (*hex & 0x00FFFFFF) | (seg7[s1%10] << 24);
 }
 
@@ -72,6 +76,8 @@ void display_distance2(float d2) {
     int s2 = (int)d2;
     if(s2 > 999) s2 = 999;
     if(s2 < 0)   s2 = 0;
+
+    // HEX2=hundreds, HEX1=tens, HEX0=units, keep HEX3 unchanged
     *hex = (*hex & 0xFF000000) |
            (seg7[(s2/100)%10] << 16) |
            (seg7[(s2/10)%10]  <<  8) |
@@ -88,7 +94,7 @@ void show_disengage() {
     *hex   = (0x5E << 24) | (0x06 << 16) | (0x6D << 8) | 0x79;
 }
 
-// --- SENSOR FUNCTIONS ---
+// SENSOR FUNCTIONS
 void trigger(HCSR04_t *sensor) {
     digitalWrite(sensor->gpio, sensor->trig_pin, 0);
     delay(2);
@@ -107,7 +113,7 @@ float distance(HCSR04_t *sensor) {
     return (float)count / 150.0;
 }
 
-// --- AUDIO FUNCTIONS ---
+// AUDIO FUNCTIONS
 bool FIFOspace() {
     unsigned int fifospace = audio->FIFOSPACE;
     unsigned int wslc = (fifospace & 0xFF000000) >> 24;
@@ -156,24 +162,11 @@ void play_emergency_siren(int VOLUME) {
     play_tone(800, 300, VOLUME);
 }
 
-// --- VIBRATION & DELAY FUNCTIONS ---
+// VIBRATION FUNCTIONS
 int vibrationRead(VIBRATION_t *vib) {
     return digitalRead(vib->gpio, vib->pin);
 }
 
-// NEW: A safe delay that prevents ultrasonic cross-talk but "catches" taps
-bool delay_with_vib(int us, VIBRATION_t *vib) {
-    bool detected = false;
-    for(volatile int i = 0; i < us * 40; i++) {
-        // If it vibrates anytime during this delay, remember it!
-        if(vibrationRead(vib)) {
-            detected = true;
-        }
-    }
-    return detected; // We still wait the full time, then report the tap
-}
-
-// Original countTaps restored (it handles your hardware's debounce perfectly)
 int countTaps(GPIO_t *gpio, int pin) {
     int count = 1;
     int timeout = 0;
@@ -194,7 +187,7 @@ int countTaps(GPIO_t *gpio, int pin) {
     return count;
 }
 
-// --- FALL DETECTION ---
+// FALL DETECTION
 bool detectFall(float curr_d1, float curr_d2,
                 float prev_d1, float prev_d2) {
     float change1 = curr_d1 - prev_d1;
@@ -206,7 +199,6 @@ bool detectFall(float curr_d1, float curr_d2,
     return (change1 > 20.0 || change2 > 20.0);
 }
 
-// --- MAIN FUNCTION ---
 int main(void) {
     audio->CONTROL = 0xC;
     audio->CONTROL = 0x0;
@@ -219,14 +211,17 @@ int main(void) {
 
     GPIO_t *jp2 = (GPIO_t *)JP2_BASE;
 
+    // sensor 1: pin 8 trig (bit5), pin 9 echo (bit6)
     HCSR04_t sensor1 = { jp2, 5, 6 };
     pinMode(sensor1.gpio, sensor1.trig_pin, 1);
     pinMode(sensor1.gpio, sensor1.echo_pin, 0);
 
+    // sensor 2: pin 6 trig (bit3), pin 7 echo (bit4)
     HCSR04_t sensor2 = { jp2, 3, 4 };
     pinMode(sensor2.gpio, sensor2.trig_pin, 1);
     pinMode(sensor2.gpio, sensor2.echo_pin, 0);
 
+    // vibration: pin 5 (bit2)
     VIBRATION_t vib = { jp2, 2 };
     pinMode(vib.gpio, vib.pin, 0);
 
@@ -234,33 +229,25 @@ int main(void) {
     *hex54 = 0x00000000;
 
     while(1) {
-        // Read distances, but use our new safe delay to listen for taps
         float dist1 = distance(&sensor1);
-        bool vib_caught_1 = delay_with_vib(60000, &vib); 
-        
+        delay(60000);
         float dist2 = distance(&sensor2);
-        bool vib_caught_2 = delay_with_vib(60000, &vib);
+        delay(60000);
 
         // --- VIBRATION CHECK ---
-        // Trigger if we felt a tap during EITHER delay, or right this millisecond
-        if(vib_caught_1 || vib_caught_2 || vibrationRead(&vib)) {
-            
-            // First, ensure it wasn't a drop/fall
+        if(vibrationRead(&vib)) {
             if(detectFall(dist1, dist2, prev_d1, prev_d2)) {
                 assist_mode = 1;
                 show_assist();
                 play_emergency_siren(0x3FFFFFFF);
             } else {
-                // If not a fall, count the taps
                 int taps = countTaps(jp2, 2);
 
-                // Double tap activates assist mode
-                if(taps == 2 && !assist_mode) {
+                if(taps == 1 && !assist_mode) {
                     assist_mode = 1;
                     show_assist();
                     play_emergency_siren(0x3FFFFFFF);
                 }
-                // Triple tap deactivates assist mode
                 else if(taps >= 3 && assist_mode) {
                     assist_mode = 0;
                     show_disengage();
@@ -317,3 +304,4 @@ int main(void) {
 
     return 0;
 }
+```
