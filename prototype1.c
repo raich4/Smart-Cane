@@ -64,27 +64,27 @@ void display_distances(float d1, float d2) {
     int s1 = (int)d1;
     int s2 = (int)d2;
 
-    if(s1 > 999) s1 = 999;
+    if(s1 > 99)  s1 = 99;
     if(s2 > 999) s2 = 999;
     if(s1 < 0)   s1 = 0;
     if(s2 < 0)   s2 = 0;
 
-    // sensor 1 on HEX5-HEX4-HEX3
-    *hex54 = (seg7[(s1/100)%10] << 8) | seg7[(s1/10)%10];
-    *hex   = (seg7[s1%10]       << 24) |
-             (seg7[(s2/100)%10] << 16) |
-             (seg7[(s2/10) %10] <<  8) |
-              seg7[ s2     %10];
+    // sensor 1 on HEX5-HEX4 (2 digits)
+    *hex54 = (seg7[(s1/10)%10] << 8) | seg7[s1%10];
+
+    // sensor 2 on HEX2-HEX1-HEX0 (3 digits), HEX3 blank
+    *hex = (0x00 << 24) |
+           (seg7[(s2/100)%10] << 16) |
+           (seg7[(s2/10) %10] <<  8) |
+            seg7[ s2     %10];
 }
 
 void show_assist() {
-    // A S S t on HEX3-HEX0
     *hex54 = 0x00000000;
     *hex   = (0x77 << 24) | (0x6D << 16) | (0x6D << 8) | 0x78;
 }
 
 void show_disengage() {
-    // d I S E on HEX3-HEX0
     *hex54 = 0x00000000;
     *hex   = (0x5E << 24) | (0x06 << 16) | (0x6D << 8) | 0x79;
 }
@@ -206,17 +206,17 @@ int main(void) {
 
     GPIO_t *jp2 = (GPIO_t *)JP2_BASE;
 
-    // sensor 1: pin 8 trig (D5 bit5), pin 9 echo (D6 bit6)
+    // sensor 1: pin 8 trig (bit5), pin 9 echo (bit6)
     HCSR04_t sensor1 = { jp2, 5, 6 };
     pinMode(sensor1.gpio, sensor1.trig_pin, 1);
     pinMode(sensor1.gpio, sensor1.echo_pin, 0);
 
-    // sensor 2: pin 6 trig (D3 bit3), pin 7 echo (D4 bit4)
+    // sensor 2: pin 6 trig (bit3), pin 7 echo (bit4)
     HCSR04_t sensor2 = { jp2, 3, 4 };
     pinMode(sensor2.gpio, sensor2.trig_pin, 1);
     pinMode(sensor2.gpio, sensor2.echo_pin, 0);
 
-    // vibration: pin 5 (D2 bit2)
+    // vibration: pin 5 (bit2)
     VIBRATION_t vib = { jp2, 2 };
     pinMode(vib.gpio, vib.pin, 0);
 
@@ -231,14 +231,11 @@ int main(void) {
 
         // --- VIBRATION CHECK ---
         if(vibrationRead(&vib)) {
-
-            // check for quick fall first
             if(detectFall(dist1, dist2, prev_d1, prev_d2)) {
                 assist_mode = 1;
                 show_assist();
                 play_emergency_siren(0x3FFFFFFF);
             } else {
-                // normal tap — count taps
                 int taps = countTaps(jp2, 2);
 
                 if(taps == 1 && !assist_mode) {
@@ -275,13 +272,11 @@ int main(void) {
             idle_count = 0;
         }
 
-        // update previous distances
         prev_d1 = dist1;
         prev_d2 = dist2;
 
-        // --- SENSOR LOGIC (only when not in assist mode) ---
+        // --- SENSOR LOGIC ---
         if(!assist_mode) {
-
             // obstacle detection sensor 1
             if(dist1 > 0 && dist1 <= 30) {
                 if(dist1 > 20)      volume = 0x3FFFFFFF / 4;
