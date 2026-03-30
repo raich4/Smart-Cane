@@ -59,12 +59,11 @@ void delay(int us) {
     for(i = 0; i < us * 40; i++);
 }
 
-// --- HEX DISPLAY FUNCTIONS ---
+// --- HEX DISPLAY ---
 void display_distance1(float d1) {
     int s1 = (int)d1;
     if(s1 > 999) s1 = 999;
     if(s1 < 0)   s1 = 0;
-
     *hex54 = (seg7[(s1/100)%10] << 8) | seg7[(s1/10)%10];
     *hex = (*hex & 0x00FFFFFF) | (seg7[s1%10] << 24);
 }
@@ -73,7 +72,6 @@ void display_distance2(float d2) {
     int s2 = (int)d2;
     if(s2 > 999) s2 = 999;
     if(s2 < 0)   s2 = 0;
-
     *hex = (*hex & 0xFF000000) |
            (seg7[(s2/100)%10] << 16) |
            (seg7[(s2/10)%10]  <<  8) |
@@ -88,6 +86,25 @@ void show_assist() {
 void show_disengage() {
     *hex54 = 0x00000000;
     *hex   = (0x5E << 24) | (0x06 << 16) | (0x6D << 8) | 0x79;
+}
+
+// --- SENSOR FUNCTIONS ---
+void trigger(HCSR04_t *sensor) {
+    digitalWrite(sensor->gpio, sensor->trig_pin, 0);
+    delay(2);
+    digitalWrite(sensor->gpio, sensor->trig_pin, 1);
+    delay(15);
+    digitalWrite(sensor->gpio, sensor->trig_pin, 0);
+}
+
+float distance(HCSR04_t *sensor) {
+    trigger(sensor);
+    int timeout = 1000000;
+    while(digitalRead(sensor->gpio, sensor->echo_pin) == 0 && timeout > 0) timeout--;
+    if(timeout <= 0) return -1.0;
+    volatile int count = 0;
+    while(digitalRead(sensor->gpio, sensor->echo_pin) == 1) count++;
+    return (float)count / 150.0;
 }
 
 // --- AUDIO FUNCTIONS ---
@@ -139,58 +156,47 @@ void play_emergency_siren(int VOLUME) {
     play_tone(800, 300, VOLUME);
 }
 
-// --- ULTRASONIC SENSOR FUNCTIONS ---
-void trigger(HCSR04_t *sensor) {
-    digitalWrite(sensor->gpio, sensor->trig_pin, 0);
-    delay(2);
-    digitalWrite(sensor->gpio, sensor->trig_pin, 1);
-    delay(15);
-    digitalWrite(sensor->gpio, sensor->trig_pin, 0);
-}
-
-float distance(HCSR04_t *sensor) {
-    trigger(sensor);
-    int timeout = 1000000;
-    while(digitalRead(sensor->gpio, sensor->echo_pin) == 0 && timeout > 0) timeout--;
-    if(timeout <= 0) return -1.0;
-    volatile int count = 0;
-    while(digitalRead(sensor->gpio, sensor->echo_pin) == 1) count++;
-    return (float)count / 150.0;
-}
-
-// --- NEW VIBRATION LOGIC ---
-int isVibrating(VIBRATION_t *vib) {
+// --- VIBRATION & DELAY FUNCTIONS ---
+int vibrationRead(VIBRATION_t *vib) {
     return digitalRead(vib->gpio, vib->pin);
 }
 
-// Non-blocking delay: Returns true immediately if vibration is detected
-bool delayAndCheckVib(int us, VIBRATION_t *vib) {
+// NEW: A safe delay that prevents ultrasonic cross-talk but "catches" taps
+bool delay_with_vib(int us, VIBRATION_t *vib) {
+    bool detected = false;
     for(volatile int i = 0; i < us * 40; i++) {
-        if(isVibrating(vib)) return true; 
-    }
-    return false;
-}
-
-// Multi-tap detector
-int detectTaps(VIBRATION_t *vib) {
-    int taps = 1;
-    int window = 200000; // Time window to catch the second/third tap
-    
-    delay(5000); // Debounce first tap
-    
-    for(int i = 0; i < window; i++) {
-        if(isVibrating(vib)) {
-            taps++;
-            delay(5000); // Debounce subsequent tap
-            // We wait a bit before checking for a 3rd tap if needed
-            for(int j = 0; j < 50000; j++); 
+        // If it vibrates anytime during this delay, remember it!
+        if(vibrationRead(vib)) {
+            detected = true;
         }
     }
-    return taps;
+    return detected; // We still wait the full time, then report the tap
+}
+
+// Original countTaps restored (it handles your hardware's debounce perfectly)
+int countTaps(GPIO_t *gpio, int pin) {
+    int count = 1;
+    int timeout = 0;
+
+    while(digitalRead(gpio, pin));
+    delay(10000);
+
+    while(timeout < 8000) {
+        if(digitalRead(gpio, pin)) {
+            count++;
+            while(digitalRead(gpio, pin));
+            delay(10000);
+            timeout = 0;
+        }
+        delay(100);
+        timeout++;
+    }
+    return count;
 }
 
 // --- FALL DETECTION ---
-bool detectFall(float curr_d1, float curr_d2, float prev_d1, float prev_d2) {
+bool detectFall(float curr_d1, float curr_d2,
+                float prev_d1, float prev_d2) {
     float change1 = curr_d1 - prev_d1;
     float change2 = curr_d2 - prev_d2;
 
@@ -228,65 +234,68 @@ int main(void) {
     *hex54 = 0x00000000;
 
     while(1) {
-        // 1. FAST VIBRATION CHECK
-        if(isVibrating(&vib)) {
-            int tapCount = detectTaps(&vib);
-            
-            // Double tap to activate assist
-            if(tapCount == 2 && !assist_mode) {
-                assist_mode = 1;
-                show_assist();
-                play_emergency_siren(0x3FFFFFFF);
-            } 
-            // Triple tap (or more) to deactivate assist
-            else if(tapCount >= 3 && assist_mode) {
-                assist_mode = 0;
-                show_disengage();
-                delay(1000000);
-                *hex = 0x00000000; 
-                *hex54 = 0x00000000;
-            }
-        }
+        // Read distances, but use our new safe delay to listen for taps
+        float dist1 = distance(&sensor1);
+        bool vib_caught_1 = delay_with_vib(60000, &vib); 
+        
+        float dist2 = distance(&sensor2);
+        bool vib_caught_2 = delay_with_vib(60000, &vib);
 
-        // 2. SENSOR LOGIC (Skipped if in assist mode to prioritize taps)
-        if(!assist_mode) {
-            float dist1 = distance(&sensor1);
+        // --- VIBRATION CHECK ---
+        // Trigger if we felt a tap during EITHER delay, or right this millisecond
+        if(vib_caught_1 || vib_caught_2 || vibrationRead(&vib)) {
             
-            // Check for vibration while waiting between sensor pings
-            // Reduced to 30ms so we loop back to the main tap check faster
-            if(delayAndCheckVib(30000, &vib)) continue; 
-            
-            float dist2 = distance(&sensor2);
-            
-            if(delayAndCheckVib(30000, &vib)) continue;
-
-            // --- FALL DETECTION LOGIC ---
+            // First, ensure it wasn't a drop/fall
             if(detectFall(dist1, dist2, prev_d1, prev_d2)) {
                 assist_mode = 1;
                 show_assist();
                 play_emergency_siren(0x3FFFFFFF);
-            }
-
-            // --- SLOW FALL / IDLE DETECTION ---
-            float change1 = dist1 - prev_d1;
-            float change2 = dist2 - prev_d2;
-            if(change1 < 0) change1 = -change1;
-            if(change2 < 0) change2 = -change2;
-
-            if(change1 < 2.0 && change2 < 2.0) {
-                idle_count++;
             } else {
-                idle_count = 0;
-            }
+                // If not a fall, count the taps
+                int taps = countTaps(jp2, 2);
 
-            if(idle_count >= 50) {
-                assist_mode = 1;
-                show_assist();
-                play_emergency_siren(0x3FFFFFFF);
-                idle_count = 0;
+                // Double tap activates assist mode
+                if(taps == 2 && !assist_mode) {
+                    assist_mode = 1;
+                    show_assist();
+                    play_emergency_siren(0x3FFFFFFF);
+                }
+                // Triple tap deactivates assist mode
+                else if(taps >= 3 && assist_mode) {
+                    assist_mode = 0;
+                    show_disengage();
+                    delay(1000000);
+                    *hex   = 0x00000000;
+                    *hex54 = 0x00000000;
+                }
             }
+        }
 
-            // --- DISTANCE ALERTS ---
+        // --- SLOW FALL DETECTION ---
+        float change1 = dist1 - prev_d1;
+        float change2 = dist2 - prev_d2;
+        if(change1 < 0) change1 = -change1;
+        if(change2 < 0) change2 = -change2;
+
+        if(change1 < 2.0 && change2 < 2.0) {
+            idle_count++;
+        } else {
+            idle_count = 0;
+        }
+
+        if(idle_count >= 50 && !assist_mode) {
+            assist_mode = 1;
+            show_assist();
+            play_emergency_siren(0x3FFFFFFF);
+            idle_count = 0;
+        }
+
+        prev_d1 = dist1;
+        prev_d2 = dist2;
+
+        // --- SENSOR LOGIC ---
+        if(!assist_mode) {
+            // obstacle detection sensor 1
             if(dist1 > 0 && dist1 <= 30) {
                 if(dist1 > 20)      volume = 0x3FFFFFFF / 4;
                 else if(dist1 > 10) volume = 0x3FFFFFFF / 2;
@@ -294,16 +303,15 @@ int main(void) {
                 play_obstacle_alert(volume);
             }
 
+            // ledge detection sensor 2
             if(dist2 >= 18.0)      play_emergency_siren(0x3FFFFFFF);
             else if(dist2 >= 10.0) play_ledge_alert(0x3FFFFFFF);
             else if(dist2 >= 5.0)  play_ledge_alert(0x3FFFFFFF / 2);
             else if(dist2 >= 3.0)  play_ledge_alert(0x3FFFFFFF / 4);
 
+            // show both distances on HEX
             display_distance1(dist1);
             display_distance2(dist2);
-
-            prev_d1 = dist1;
-            prev_d2 = dist2;
         }
     }
 
