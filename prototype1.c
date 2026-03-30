@@ -30,7 +30,7 @@ typedef struct {
     int last_state;
     int tap_count;
     int timer;
-    int event; // 1 = single, 3 = triple
+    int event; // 1 = single tap, 3 = triple tap
 } TapState;
 
 typedef struct {
@@ -200,6 +200,8 @@ void updateTap(TapState *t, GPIO_t *gpio, int pin) {
 
 // ================= FALL DETECTION =================
 bool detectFall(float d1, float d2, float p1, float p2) {
+    if(d1 <= 0 || d2 <= 0 || p1 <= 0 || p2 <= 0) return false;
+
     float c1 = d1 - p1;
     float c2 = d2 - p2;
 
@@ -211,6 +213,7 @@ bool detectFall(float d1, float d2, float p1, float p2) {
 
 // ================= MAIN =================
 int main() {
+
     audio->CONTROL = 0xC;
     audio->CONTROL = 0x0;
 
@@ -229,8 +232,11 @@ int main() {
     SystemMode mode = MODE_NORMAL;
 
     float d1=0,d2=0,prev1=0,prev2=0;
+
     int sensor_timer = 0;
     int idle_counter = 0;
+    int fall_cooldown = 0;
+    int system_ready = 0;
 
     while(1) {
 
@@ -238,11 +244,15 @@ int main() {
         updateTap(&tap, jp2, 2);
         updateAudio();
 
+        if(fall_cooldown > 0) fall_cooldown--;
+
         // --- SENSOR UPDATE ---
         if(++sensor_timer > 20000) {
             d1 = distance(&s1);
             d2 = distance(&s2);
             sensor_timer = 0;
+
+            if(d1 > 0 && d2 > 0) system_ready = 1;
         }
 
         // --- TAP EVENTS ---
@@ -251,6 +261,7 @@ int main() {
                 mode = MODE_ASSIST;
                 show_assist();
                 startTone(800,300,0x3FFFFFFF);
+                fall_cooldown = 200000;
             }
             tap.event = 0;
         }
@@ -259,16 +270,18 @@ int main() {
             if(mode == MODE_ASSIST) {
                 mode = MODE_NORMAL;
                 show_disengage();
+                fall_cooldown = 200000;
             }
             tap.event = 0;
         }
 
         // --- FALL DETECTION ---
-        if(mode == MODE_NORMAL) {
+        if(system_ready && fall_cooldown == 0 && mode == MODE_NORMAL) {
             if(detectFall(d1,d2,prev1,prev2)) {
                 mode = MODE_ASSIST;
                 show_assist();
                 startTone(600,500,0x3FFFFFFF);
+                fall_cooldown = 200000;
             }
         }
 
@@ -281,10 +294,11 @@ int main() {
         if(c1<2 && c2<2) idle_counter++;
         else idle_counter=0;
 
-        if(idle_counter > 50 && mode == MODE_NORMAL) {
+        if(idle_counter > 50 && mode == MODE_NORMAL && fall_cooldown == 0) {
             mode = MODE_ASSIST;
             show_assist();
             startTone(600,500,0x3FFFFFFF);
+            fall_cooldown = 200000;
             idle_counter = 0;
         }
 
