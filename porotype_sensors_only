@@ -1,0 +1,343 @@
+/*******************************************************************************
+ * STEP 1: Two-sensor integration + fall detection. No vibration yet.
+ *
+ * Fall detection uses sensor readings only:
+ *
+ *   FAST FALL  — |Δdist| > FAST_THRESHOLD in a single iteration.
+ *                Both sensors should see a large change simultaneously.
+ *
+ *   SLOW FALL  — dist changes accumulate consistently in one direction
+ *                over SLOW_THRESHOLD consecutive iterations.
+ *                Drift counter increments when sign of change matches
+ *                last iteration; resets when direction reverses.
+ *
+ * JP2 pin mapping:
+ *   bit 3 — sensor 2 TRIG  (output)
+ *   bit 4 — sensor 2 ECHO  (input)
+ *   bit 5 — sensor 1 TRIG  (output)
+ *   bit 6 — sensor 1 ECHO  (input)
+ ******************************************************************************/
+
+#include <stdlib.h>
+#include <stdbool.h>
+
+#define JP2_BASE        0xFF200070
+#define HEX3_HEX0_BASE  0xFF200020
+#define HEX5_HEX4_BASE  0xFF200030
+#define AUDIO_BASE      0xFF203040
+#define SAMPLE_RATE     8000
+
+// ── Fall detection tuning ────────────────────────────────────────────────────
+// A single-iteration distance jump larger than this (cm) = fast fall.
+#define FAST_THRESHOLD      20.0f
+
+// How many consecutive same-direction iterations = slow fall.
+// Each iteration is ~20-40 ms; 20 iterations ≈ 0.4-0.8 s of consistent drift.
+#define SLOW_THRESHOLD      20
+
+// Minimum per-iteration change to count as intentional drift (filters noise).
+#define DRIFT_MIN_CHANGE    1.5f
+
+// ─────────────────────────────────────────
+// PERIPHERAL STRUCTS
+// ─────────────────────────────────────────
+typedef struct {
+    volatile unsigned int CONTROL;
+    volatile unsigned int FIFOSPACE;
+    volatile unsigned int LEFTDATA;
+    volatile unsigned int RIGHTDATA;
+} AUDIO_t;
+
+typedef struct {
+    volatile unsigned int DATA;
+    volatile unsigned int DDR;
+} GPIO_t;
+
+typedef struct {
+    GPIO_t *gpio;
+    int     trig_pin;
+    int     echo_pin;
+} HCSR04_t;
+
+AUDIO_t      *audio = (AUDIO_t *)AUDIO_BASE;
+volatile int *hex   = (volatile int *)HEX3_HEX0_BASE;
+volatile int *hex54 = (volatile int *)HEX5_HEX4_BASE;
+GPIO_t       *jp2   = (GPIO_t *)JP2_BASE;
+
+const unsigned char seg7[] = {
+    0x3F, 0x06, 0x5B, 0x4F, 0x66,
+    0x6D, 0x7D, 0x07, 0x7F, 0x6F
+};
+
+// ─────────────────────────────────────────
+// GPIO
+// ─────────────────────────────────────────
+void pinMode(GPIO_t *gpio, int pin, int mode) {
+    if (mode == 1) gpio->DDR |=  (1 << pin);
+    else           gpio->DDR &= ~(1 << pin);
+}
+
+void digitalWrite(GPIO_t *gpio, int pin, int val) {
+    if (val) gpio->DATA |=  (1 << pin);
+    else     gpio->DATA &= ~(1 << pin);
+}
+
+int digitalRead(GPIO_t *gpio, int pin) {
+    return (gpio->DATA >> pin) & 1;
+}
+
+void delay_us(int us) {
+    volatile int i;
+    for (i = 0; i < us * 40; i++);
+}
+
+// ─────────────────────────────────────────
+// HEX DISPLAY
+// ─────────────────────────────────────────
+void display_distance1(int cm) {
+    if (cm > 999) cm = 999;
+    if (cm < 0)   cm = 0;
+    *hex54 = (seg7[(cm / 100) % 10] << 8) | seg7[(cm / 10) % 10];
+    *hex   = (*hex & 0x00FFFFFF) | (seg7[cm % 10] << 24);
+}
+
+void display_distance2(int cm) {
+    if (cm > 999) cm = 999;
+    if (cm < 0)   cm = 0;
+    *hex = (*hex & 0xFF000000)
+         | (seg7[(cm / 100) % 10] << 16)
+         | (seg7[(cm / 10)  % 10] <<  8)
+         |  seg7[cm % 10];
+}
+
+// "Err" on respective digits when sensor returns -1
+void display_error1(void) {
+    *hex54 = (0x79 << 8) | 0x50;
+    *hex   = (*hex & 0x00FFFFFF) | (0x50 << 24);
+}
+
+void display_error2(void) {
+    *hex = (*hex & 0xFF000000) | (0x79 << 16) | (0x50 << 8) | 0x50;
+}
+
+// "FALL" across all six digits
+void show_fall(void) {
+    *hex54 = (0x71 << 8) | 0x77;          // F A
+    *hex   = (0x38 << 24) | (0x38 << 16)  // L L
+           | (0x00 << 8)  | 0x00;
+}
+
+// ─────────────────────────────────────────
+// AUDIO
+// ─────────────────────────────────────────
+static bool FIFOspace(void) {
+    unsigned int fs = audio->FIFOSPACE;
+    return ((fs >> 24) & 0xFF) > 0 && ((fs >> 16) & 0xFF) > 0;
+}
+
+void play_sample(int s) {
+    while (!FIFOspace());
+    audio->LEFTDATA  = s;
+    audio->RIGHTDATA = s;
+}
+
+void play_tone(int freq, int duration_ms, int vol) {
+    if (freq == 0) {
+        int n = (SAMPLE_RATE * duration_ms) / 1000;
+        for (int i = 0; i < n; i++) play_sample(0);
+        return;
+    }
+    int half = SAMPLE_RATE / freq / 2;
+    int n    = (SAMPLE_RATE * duration_ms) / 1000;
+    int cnt  = 0;
+    bool hi  = true;
+    for (int i = 0; i < n; i++) {
+        play_sample(hi ? vol : -vol);
+        if (++cnt >= half) { hi = !hi; cnt = 0; }
+    }
+}
+
+void play_obstacle_alert(int vol) {
+    play_tone(1000, 100, vol);
+    play_tone(0,    100, vol);
+}
+
+void play_ledge_alert(int vol) {
+    play_tone(300, 400, vol);
+    play_tone(0,   100, vol);
+}
+
+void play_emergency_siren(int vol) {
+    play_tone(600, 300, vol);
+    play_tone(800, 300, vol);
+}
+
+// ─────────────────────────────────────────
+// HC-SR04
+// ─────────────────────────────────────────
+float distance_read(HCSR04_t *s) {
+    digitalWrite(s->gpio, s->trig_pin, 0);
+    delay_us(2);
+    digitalWrite(s->gpio, s->trig_pin, 1);
+    delay_us(10);
+    digitalWrite(s->gpio, s->trig_pin, 0);
+
+    int timeout = 1200000;
+    while (digitalRead(s->gpio, s->echo_pin) == 0 && timeout-- > 0);
+    if (timeout <= 0) return -1.0f;
+
+    volatile int count = 0;
+    int echo_timeout   = 1200000;
+    while (digitalRead(s->gpio, s->echo_pin) == 1 && echo_timeout-- > 0)
+        count++;
+
+    return (float)count / 150.0f;
+}
+
+// ─────────────────────────────────────────
+// FALL DETECTION
+//
+// Call once per loop with fresh readings.
+// Returns: 0 = no fall, 1 = fast fall, 2 = slow fall.
+//
+// Internal state is kept in static locals so this is self-contained.
+// ─────────────────────────────────────────
+int detect_fall(float d1, float d2) {
+    static float prev_d1      = -1.0f;
+    static float prev_d2      = -1.0f;
+    static int   drift_count  = 0;
+    static int   prev_sign1   = 0;   // sign of last valid Δd1
+    static int   prev_sign2   = 0;
+
+    // Skip on first call or bad reads — just initialise prev
+    if (prev_d1 < 0.0f || d1 < 0.0f || d2 < 0.0f) {
+        if (d1 >= 0.0f) prev_d1 = d1;
+        if (d2 >= 0.0f) prev_d2 = d2;
+        return 0;
+    }
+
+    float delta1 = d1 - prev_d1;
+    float delta2 = d2 - prev_d2;
+    float abs1   = delta1 < 0 ? -delta1 : delta1;
+    float abs2   = delta2 < 0 ? -delta2 : delta2;
+
+    // ── Fast fall: large jump on BOTH sensors in same iteration ──────────
+    // Requiring both sensors to trigger prevents a single glitchy read
+    // from firing a false alarm.
+    if (abs1 > FAST_THRESHOLD && abs2 > FAST_THRESHOLD) {
+        drift_count = 0;
+        prev_d1 = d1;
+        prev_d2 = d2;
+        return 1;
+    }
+
+    // ── Slow fall: consistent directional drift ───────────────────────────
+    // Use average delta across both sensors for robustness.
+    float avg_delta = (delta1 + delta2) / 2.0f;
+    float abs_avg   = avg_delta < 0 ? -avg_delta : avg_delta;
+
+    if (abs_avg >= DRIFT_MIN_CHANGE) {
+        int sign = (avg_delta > 0) ? 1 : -1;
+
+        if (sign == prev_sign1 && sign == prev_sign2) {
+            // Same direction as last two iterations — drift is consistent
+            drift_count++;
+        } else {
+            // Direction changed — reset
+            drift_count = 0;
+        }
+        prev_sign2 = prev_sign1;
+        prev_sign1 = sign;
+    } else {
+        // Change too small to count — decay drift counter slowly
+        // (don't reset immediately to handle brief stable periods mid-slump)
+        if (drift_count > 0) drift_count--;
+        prev_sign1 = 0;
+        prev_sign2 = 0;
+    }
+
+    prev_d1 = d1;
+    prev_d2 = d2;
+
+    if (drift_count >= SLOW_THRESHOLD) {
+        drift_count = 0;
+        return 2;
+    }
+
+    return 0;
+}
+
+// ─────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────
+int main(void) {
+    audio->CONTROL = 0xC;
+    audio->CONTROL = 0x0;
+
+    HCSR04_t sensor1 = { jp2, 5, 6 };
+    pinMode(jp2, sensor1.trig_pin, 1);
+    pinMode(jp2, sensor1.echo_pin, 0);
+
+    HCSR04_t sensor2 = { jp2, 3, 4 };
+    pinMode(jp2, sensor2.trig_pin, 1);
+    pinMode(jp2, sensor2.echo_pin, 0);
+
+    digitalWrite(jp2, sensor1.trig_pin, 0);
+    digitalWrite(jp2, sensor2.trig_pin, 0);
+
+    *hex   = 0x00000000;
+    *hex54 = 0x00000000;
+
+    int assist_mode = 0;
+
+    while (1) {
+        // ── Read sensors ─────────────────────────────────────────────────
+        float dist1 = distance_read(&sensor1);
+        delay_us(500);
+        float dist2 = distance_read(&sensor2);
+        delay_us(500);
+
+        // ── Fall detection ───────────────────────────────────────────────
+        int fall = detect_fall(dist1, dist2);
+
+        if (fall == 1 && !assist_mode) {
+            // Fast fall — immediate siren
+            assist_mode = 1;
+            show_fall();
+            play_emergency_siren(0x3FFFFFFF);
+            play_emergency_siren(0x3FFFFFFF);
+        }
+        else if (fall == 2 && !assist_mode) {
+            // Slow fall — same response but you could use a different alert
+            assist_mode = 1;
+            show_fall();
+            play_emergency_siren(0x3FFFFFFF);
+        }
+
+        // ── Display and proximity alerts (outside assist mode) ───────────
+        if (!assist_mode) {
+            if (dist1 < 0) display_error1();
+            else           display_distance1((int)dist1);
+
+            if (dist2 < 0) display_error2();
+            else           display_distance2((int)dist2);
+
+            // Obstacle — sensor 1
+            if (dist1 > 0 && dist1 <= 30) {
+                unsigned int vol;
+                if      (dist1 > 20) vol = 0x3FFFFFFF / 4;
+                else if (dist1 > 10) vol = 0x3FFFFFFF / 2;
+                else                 vol = 0x3FFFFFFF;
+                play_obstacle_alert(vol);
+            }
+
+            // Ledge — sensor 2
+            if      (dist2 >= 18.0f) play_emergency_siren(0x3FFFFFFF);
+            else if (dist2 >= 10.0f) play_ledge_alert(0x3FFFFFFF);
+            else if (dist2 >=  5.0f) play_ledge_alert(0x3FFFFFFF / 2);
+            else if (dist2 >=  3.0f) play_ledge_alert(0x3FFFFFFF / 4);
+        }
+    }
+
+    return 0;
+}
