@@ -8,12 +8,10 @@
 #define SAMPLE_RATE     8000
 
 #define MOUNT_HEIGHT        12.0f
-
 #define LEDGE_WARN_LOW      (MOUNT_HEIGHT + 3.0f)
 #define LEDGE_WARN_MID      (MOUNT_HEIGHT + 6.0f)
 #define LEDGE_WARN_HIGH     (MOUNT_HEIGHT + 10.0f)
 #define LEDGE_DANGER        (MOUNT_HEIGHT + 15.0f)
-
 #define S2_OPEN_AIR         (MOUNT_HEIGHT + 25.0f)
 #define FAST_FALL_VELOCITY  15.0f
 #define SLOW_FALL_SUSTAIN   12
@@ -206,8 +204,8 @@ float distance_read(HCSR04_t *s) {
     while (digitalRead(s->gpio, s->echo_pin) == 0 && timeout-- > 0);
     if (timeout <= 0) return -1.0f;
 
-    volatile int count = 0;
-    int echo_timeout   = 1200000;
+    volatile int count     = 0;
+    int          echo_timeout = 1200000;
     while (digitalRead(s->gpio, s->echo_pin) == 1 && echo_timeout-- > 0)
         count++;
 
@@ -237,7 +235,7 @@ int detect_fall_state(float d_down) {
             if (d > S2_OPEN_AIR) {
                 sustain_count = 1;
                 return_timer  = 0;
-                state = STATE_OPEN_AIR;
+                state         = STATE_OPEN_AIR;
                 if (velocity >= FAST_FALL_VELOCITY) {
                     state         = STATE_NORMAL;
                     sustain_count = 0;
@@ -310,6 +308,10 @@ int detect_fall_state(float d_down) {
 
 // MAIN
 int main(void) {
+    // show 0000 on startup to confirm code is running
+    *hex   = 0x3F3F3F3F;
+    *hex54 = 0x00003F3F;
+
     audio->CONTROL = 0xC;
     audio->CONTROL = 0x0;
 
@@ -330,6 +332,9 @@ int main(void) {
     digitalWrite(jp2, sensor1.trig_pin, 0);
     digitalWrite(jp2, sensor2.trig_pin, 0);
 
+    // startup delay — ignore vibration noise on boot
+    delay_us(2000000);
+
     *hex   = 0x00000000;
     *hex54 = 0x00000000;
 
@@ -346,13 +351,11 @@ int main(void) {
             int taps = countTaps(jp2, 2);
 
             if(taps == 1 && !assist_mode) {
-                // manual assistance call
                 assist_mode = 1;
                 show_assist();
                 play_emergency_siren(0x3FFFFFFF);
             }
             else if(taps >= 3 && assist_mode) {
-                // disarm assistance
                 assist_mode = 0;
                 show_disengage();
                 delay_us(1000000);
