@@ -1,15 +1,22 @@
 /*******************************************************************************
- * STEP 1: Two-sensor integration + fall detection. No vibration yet.
+ * Assistive cane — DE1-SoC bare-metal
  *
- * Fall detection uses sensor readings only:
+ * Device is mounted ~5 cm above the floor at the base of the cane.
  *
- *   FAST FALL  — |Δdist| > FAST_THRESHOLD in a single iteration.
- *                Both sensors should see a large change simultaneously.
+ * Sensor roles:
+ *   Sensor 1 — top face, pointing DOWN
+ *       Reads ground ~5 cm below. Used for ledge / step / drop detection.
+ *       Ignored for fall detection (distance barely changes when cane tips).
  *
- *   SLOW FALL  — dist changes accumulate consistently in one direction
- *                over SLOW_THRESHOLD consecutive iterations.
- *                Drift counter increments when sign of change matches
- *                last iteration; resets when direction reverses.
+ *   Sensor 2 — side face, pointing FORWARD
+ *       Reads obstacles at ankle/shin height during normal use.
+ *       Used for fall detection: when cane tips over the forward sensor
+ *       sweeps into open air and reads max range or times out.
+ *
+ * Fall detection:
+ *   FALL_OPEN_AIR   — if sensor 2 reads above this (cm), counts as open-air.
+ *   FALL_CONFIRM    — how many consecutive open-air reads confirm a fall.
+ *                     Prevents a single open-corridor step from triggering.
  *
  * JP2 pin mapping:
  *   bit 3 — sensor 2 TRIG  (output)
@@ -27,16 +34,21 @@
 #define AUDIO_BASE      0xFF203040
 #define SAMPLE_RATE     8000
 
-// ── Fall detection tuning ────────────────────────────────────────────────────
-// A single-iteration distance jump larger than this (cm) = fast fall.
-#define FAST_THRESHOLD      20.0f
+// ── Tuning constants ─────────────────────────────────────────────────────────
 
-// How many consecutive same-direction iterations = slow fall.
-// Each iteration is ~20-40 ms; 20 iterations ≈ 0.4-0.8 s of consistent drift.
-#define SLOW_THRESHOLD      20
+// Sensor 2 (forward): above this distance (cm) = cane is tipped / open air
+#define FALL_OPEN_AIR       150.0f
 
-// Minimum per-iteration change to count as intentional drift (filters noise).
-#define DRIFT_MIN_CHANGE    1.5f
+// How many consecutive open-air reads before triggering fall alert
+// Lower = faster response, higher = fewer false positives in open spaces
+#define FALL_CONFIRM        3
+
+// Sensor 1 (down): ledge thresholds (cm above ground)
+// Normal cane-tip height ≈ 5 cm. A drop/ledge raises this significantly.
+#define LEDGE_DANGER        15.0f   // emergency — large drop
+#define LEDGE_WARN_HIGH     10.0f   // strong warning
+#define LEDGE_WARN_MID       8.0f   // medium warning
+#define LEDGE_WARN_LOW       6.5f   // gentle warning
 
 // ─────────────────────────────────────────
 // PERIPHERAL STRUCTS
@@ -110,21 +122,34 @@ void display_distance2(int cm) {
          |  seg7[cm % 10];
 }
 
-// "Err" on respective digits when sensor returns -1
 void display_error1(void) {
+    // "Err" on HEX5-HEX3
     *hex54 = (0x79 << 8) | 0x50;
     *hex   = (*hex & 0x00FFFFFF) | (0x50 << 24);
 }
 
 void display_error2(void) {
+    // "Err" on HEX2-HEX0
     *hex = (*hex & 0xFF000000) | (0x79 << 16) | (0x50 << 8) | 0x50;
 }
 
 // "FALL" across all six digits
 void show_fall(void) {
-    *hex54 = (0x71 << 8) | 0x77;          // F A
-    *hex   = (0x38 << 24) | (0x38 << 16)  // L L
-           | (0x00 << 8)  | 0x00;
+    // F=0x71  A=0x77  L=0x38  L=0x38
+    *hex54 = (0x71 << 8) | 0x77;
+    *hex   = (0x38 << 24) | (0x38 << 16) | 0x0000;
+}
+
+// "ASST" (assist mode active)
+void show_assist(void) {
+    *hex54 = 0x00000000;
+    *hex   = (0x77 << 24) | (0x6D << 16) | (0x6D << 8) | 0x78;
+}
+
+// "dISE" (disengaged)
+void show_disengage(void) {
+    *hex54 = 0x00000000;
+    *hex   = (0x5E << 24) | (0x06 << 16) | (0x6D << 8) | 0x79;
 }
 
 // ─────────────────────────────────────────
@@ -182,10 +207,12 @@ float distance_read(HCSR04_t *s) {
     delay_us(10);
     digitalWrite(s->gpio, s->trig_pin, 0);
 
+    // Wait for echo HIGH
     int timeout = 1200000;
     while (digitalRead(s->gpio, s->echo_pin) == 0 && timeout-- > 0);
-    if (timeout <= 0) return -1.0f;
+    if (timeout <= 0) return -1.0f;   // nothing detected / sensor timeout
 
+    // Count echo HIGH duration
     volatile int count = 0;
     int echo_timeout   = 1200000;
     while (digitalRead(s->gpio, s->echo_pin) == 1 && echo_timeout-- > 0)
@@ -195,73 +222,34 @@ float distance_read(HCSR04_t *s) {
 }
 
 // ─────────────────────────────────────────
-// FALL DETECTION
+// FALL DETECTION  (sensor 2 — forward-facing only)
 //
-// Call once per loop with fresh readings.
-// Returns: 0 = no fall, 1 = fast fall, 2 = slow fall.
+// A fall tips the cane so sensor 2 sweeps into open air.
+// We confirm over FALL_CONFIRM consecutive readings to avoid
+// false positives when walking in open corridors.
 //
-// Internal state is kept in static locals so this is self-contained.
+// Returns 1 on confirmed fall, 0 otherwise.
 // ─────────────────────────────────────────
-int detect_fall(float d1, float d2) {
-    static float prev_d1      = -1.0f;
-    static float prev_d2      = -1.0f;
-    static int   drift_count  = 0;
-    static int   prev_sign1   = 0;   // sign of last valid Δd1
-    static int   prev_sign2   = 0;
+int detect_fall(float fwd_dist) {
+    static int open_air_count = 0;
 
-    // Skip on first call or bad reads — just initialise prev
-    if (prev_d1 < 0.0f || d1 < 0.0f || d2 < 0.0f) {
-        if (d1 >= 0.0f) prev_d1 = d1;
-        if (d2 >= 0.0f) prev_d2 = d2;
-        return 0;
-    }
+    // Open-air condition: reading above threshold OR sensor timeout (-1)
+    bool is_open = (fwd_dist < 0.0f || fwd_dist > FALL_OPEN_AIR);
 
-    float delta1 = d1 - prev_d1;
-    float delta2 = d2 - prev_d2;
-    float abs1   = delta1 < 0 ? -delta1 : delta1;
-    float abs2   = delta2 < 0 ? -delta2 : delta2;
-
-    // ── Fast fall: large jump on BOTH sensors in same iteration ──────────
-    // Requiring both sensors to trigger prevents a single glitchy read
-    // from firing a false alarm.
-    if (abs1 > FAST_THRESHOLD && abs2 > FAST_THRESHOLD) {
-        drift_count = 0;
-        prev_d1 = d1;
-        prev_d2 = d2;
-        return 1;
-    }
-
-    // ── Slow fall: consistent directional drift ───────────────────────────
-    // Use average delta across both sensors for robustness.
-    float avg_delta = (delta1 + delta2) / 2.0f;
-    float abs_avg   = avg_delta < 0 ? -avg_delta : avg_delta;
-
-    if (abs_avg >= DRIFT_MIN_CHANGE) {
-        int sign = (avg_delta > 0) ? 1 : -1;
-
-        if (sign == prev_sign1 && sign == prev_sign2) {
-            // Same direction as last two iterations — drift is consistent
-            drift_count++;
-        } else {
-            // Direction changed — reset
-            drift_count = 0;
-        }
-        prev_sign2 = prev_sign1;
-        prev_sign1 = sign;
+    if (is_open) {
+        open_air_count++;
     } else {
-        // Change too small to count — decay drift counter slowly
-        // (don't reset immediately to handle brief stable periods mid-slump)
-        if (drift_count > 0) drift_count--;
-        prev_sign1 = 0;
-        prev_sign2 = 0;
+        // Cane is back upright — clear counter
+        open_air_count = 0;
     }
 
-    prev_d1 = d1;
-    prev_d2 = d2;
+    // Debug: show open_air_count on HEX1-HEX0 so you can watch it climb
+    // Remove this line once fall detection is confirmed working
+    *hex = (*hex & 0xFFFFFF00) | seg7[open_air_count < 10 ? open_air_count : 9];
 
-    if (drift_count >= SLOW_THRESHOLD) {
-        drift_count = 0;
-        return 2;
+    if (open_air_count >= FALL_CONFIRM) {
+        open_air_count = 0;   // reset so it doesn't re-trigger immediately
+        return 1;
     }
 
     return 0;
@@ -274,10 +262,12 @@ int main(void) {
     audio->CONTROL = 0xC;
     audio->CONTROL = 0x0;
 
+    // Sensor 1: top face, pointing down — ledge detection
     HCSR04_t sensor1 = { jp2, 5, 6 };
     pinMode(jp2, sensor1.trig_pin, 1);
     pinMode(jp2, sensor1.echo_pin, 0);
 
+    // Sensor 2: side face, pointing forward — obstacle + fall detection
     HCSR04_t sensor2 = { jp2, 3, 4 };
     pinMode(jp2, sensor2.trig_pin, 1);
     pinMode(jp2, sensor2.echo_pin, 0);
@@ -292,50 +282,55 @@ int main(void) {
 
     while (1) {
         // ── Read sensors ─────────────────────────────────────────────────
-        float dist1 = distance_read(&sensor1);
+        float dist_down = distance_read(&sensor1);   // cm to ground below
         delay_us(500);
-        float dist2 = distance_read(&sensor2);
+        float dist_fwd  = distance_read(&sensor2);   // cm to obstacle ahead
         delay_us(500);
 
-        // ── Fall detection ───────────────────────────────────────────────
-        int fall = detect_fall(dist1, dist2);
-
-        if (fall == 1 && !assist_mode) {
-            // Fast fall — immediate siren
+        // ── Fall detection (forward sensor only) ─────────────────────────
+        if (!assist_mode && detect_fall(dist_fwd)) {
             assist_mode = 1;
             show_fall();
             play_emergency_siren(0x3FFFFFFF);
             play_emergency_siren(0x3FFFFFFF);
-        }
-        else if (fall == 2 && !assist_mode) {
-            // Slow fall — same response but you could use a different alert
-            assist_mode = 1;
-            show_fall();
-            play_emergency_siren(0x3FFFFFFF);
+            // Hold fall display briefly so the user can see it
+            delay_us(2000000);
+            show_assist();
         }
 
-        // ── Display and proximity alerts (outside assist mode) ───────────
+        // ── Normal operation (outside assist mode) ───────────────────────
         if (!assist_mode) {
-            if (dist1 < 0) display_error1();
-            else           display_distance1((int)dist1);
 
-            if (dist2 < 0) display_error2();
-            else           display_distance2((int)dist2);
+            // Display: HEX5-HEX3 = down distance, HEX2-HEX0 = forward distance
+            if (dist_down < 0) display_error1();
+            else               display_distance1((int)dist_down);
 
-            // Obstacle — sensor 1
-            if (dist1 > 0 && dist1 <= 30) {
-                unsigned int vol;
-                if      (dist1 > 20) vol = 0x3FFFFFFF / 4;
-                else if (dist1 > 10) vol = 0x3FFFFFFF / 2;
-                else                 vol = 0x3FFFFFFF;
-                play_obstacle_alert(vol);
+            if (dist_fwd < 0)  display_error2();
+            else               display_distance2((int)dist_fwd);
+
+            // ── Ledge / drop detection (sensor 1, pointing down) ─────────
+            // Normal reading ≈ 5 cm. If it rises, the cane tip is over a drop.
+            if (dist_down >= LEDGE_DANGER) {
+                // Large drop ahead — emergency
+                play_emergency_siren(0x3FFFFFFF);
+            } else if (dist_down >= LEDGE_WARN_HIGH) {
+                play_ledge_alert(0x3FFFFFFF);
+            } else if (dist_down >= LEDGE_WARN_MID) {
+                play_ledge_alert(0x3FFFFFFF / 2);
+            } else if (dist_down >= LEDGE_WARN_LOW) {
+                play_ledge_alert(0x3FFFFFFF / 4);
             }
 
-            // Ledge — sensor 2
-            if      (dist2 >= 18.0f) play_emergency_siren(0x3FFFFFFF);
-            else if (dist2 >= 10.0f) play_ledge_alert(0x3FFFFFFF);
-            else if (dist2 >=  5.0f) play_ledge_alert(0x3FFFFFFF / 2);
-            else if (dist2 >=  3.0f) play_ledge_alert(0x3FFFFFFF / 4);
+            // ── Obstacle detection (sensor 2, pointing forward) ──────────
+            // Only alert when something is actually close —
+            // ignore open-air readings (those are handled by fall detection)
+            if (dist_fwd > 0 && dist_fwd <= 100.0f) {
+                unsigned int vol;
+                if      (dist_fwd > 60) vol = 0x3FFFFFFF / 4;
+                else if (dist_fwd > 30) vol = 0x3FFFFFFF / 2;
+                else                    vol = 0x3FFFFFFF;
+                play_obstacle_alert(vol);
+            }
         }
     }
 
