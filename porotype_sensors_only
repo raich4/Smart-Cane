@@ -1,23 +1,19 @@
 /*******************************************************************************
  * Assistive cane — DE1-SoC bare-metal
  *
- * Device mounted ~5 cm above floor at base of cane.
+ * Device mounted 10–15 cm above floor at base of cane.
+ * Set MOUNT_HEIGHT to your actual measured value.
  *
  * Sensor roles:
- *   Sensor 1 — top face, pointing DOWN
- *       Normal: reads ~5 cm to floor.
- *       Tipped forward/sideways: loses floor, reads open air (large / -1).
- *       Used for: ledge detection + fall detection (forward/sideways tips).
- *
- *   Sensor 2 — side face, pointing FORWARD
+ *   Sensor 1 — pointing FORWARD (trig=bit5, echo=bit6)
  *       Normal: reads obstacles at shin height.
- *       Tipped backward/sideways: sweeps into open air (large / -1).
- *       Used for: obstacle detection + fall detection (backward/sideways tips).
+ *       Tipped backward/sideways: sweeps into open air.
+ *       Used for: obstacle detection + fall detection.
  *
- * Fall detection strategy:
- *   Either sensor reading open air → increment fall counter.
- *   Both sensors reading normal    → increment upright counter (clears fall).
- *   This catches all tipping directions.
+ *   Sensor 2 — pointing DOWN (trig=bit3, echo=bit4)
+ *       Normal: reads ~MOUNT_HEIGHT cm to floor.
+ *       Tipped forward/sideways: loses floor, reads open air.
+ *       Used for: ledge detection + fall detection.
  *
  * JP2 pin mapping:
  *   bit 3 — sensor 2 TRIG  (output)
@@ -35,26 +31,36 @@
 #define AUDIO_BASE      0xFF203040
 #define SAMPLE_RATE     8000
 
-// ── Tuning ───────────────────────────────────────────────────────────────────
+// ── SET THIS to your actual measured mount height in cm ──────────────────────
+// Point sensor 2 at flat ground and read the value off the HEX display.
+// Use that number here.
+#define MOUNT_HEIGHT        12.0f   // cm — adjust to your measurement
 
-// A reading above this (cm) on either sensor = open air / cane tipped
-// Sensor 1 normal ≈ 5 cm, so anything above ~20 cm is suspicious.
-// Sensor 2 normal varies; 150 cm gives a comfortable margin.
-#define S1_OPEN_AIR         20.0f
-#define S2_OPEN_AIR         150.0f
+// ── Ledge thresholds — relative to mount height ──────────────────────────────
+// These are how much ABOVE the normal reading counts as a ledge/drop.
+// e.g. at 12 cm mount height:
+//   LEDGE_WARN_LOW  = 12 + 3  = 15 cm  (small bump / uneven surface)
+//   LEDGE_WARN_MID  = 12 + 6  = 18 cm  (kerb / small step)
+//   LEDGE_WARN_HIGH = 12 + 10 = 22 cm  (large step)
+//   LEDGE_DANGER    = 12 + 15 = 27 cm  (significant drop)
+#define LEDGE_WARN_LOW      (MOUNT_HEIGHT + 3.0f)
+#define LEDGE_WARN_MID      (MOUNT_HEIGHT + 6.0f)
+#define LEDGE_WARN_HIGH     (MOUNT_HEIGHT + 10.0f)
+#define LEDGE_DANGER        (MOUNT_HEIGHT + 15.0f)
 
-// Consecutive open-air reads before declaring a fall
+// ── Fall detection thresholds ─────────────────────────────────────────────────
+// Sensor 1 (forward): above this = open air
+#define S1_OPEN_AIR         150.0f
+
+// Sensor 2 (down): above this = no longer seeing floor (cane tipped)
+// Set to mount height + a generous tolerance for surface variation
+#define S2_OPEN_AIR         (MOUNT_HEIGHT + 20.0f)
+
+// Consecutive open-air reads to confirm a fall
 #define FALL_CONFIRM        3
 
-// Consecutive normal reads before clearing fall alert (auto-upright detection)
+// Consecutive normal reads to auto-clear fall alert
 #define UPRIGHT_CONFIRM     5
-
-// Ledge thresholds for sensor 1 (cm). Normal = ~5 cm.
-// Tune these after testing on a real kerb.
-#define LEDGE_DANGER        15.0f
-#define LEDGE_WARN_HIGH     10.0f
-#define LEDGE_WARN_MID       8.0f
-#define LEDGE_WARN_LOW       6.5f
 
 // ─────────────────────────────────────────
 // PERIPHERAL STRUCTS
@@ -143,11 +149,6 @@ void show_fall(void) {
     *hex   = (0x38 << 24) | (0x38 << 16) | 0x0000;
 }
 
-void show_assist(void) {
-    *hex54 = 0x00000000;
-    *hex   = (0x77 << 24) | (0x6D << 16) | (0x6D << 8) | 0x78;
-}
-
 void show_disengage(void) {
     *hex54 = 0x00000000;
     *hex   = (0x5E << 24) | (0x06 << 16) | (0x6D << 8) | 0x79;
@@ -223,37 +224,32 @@ float distance_read(HCSR04_t *s) {
 // ─────────────────────────────────────────
 // OPEN-AIR HELPERS
 // ─────────────────────────────────────────
-
-// Returns true if sensor 1 (down) is no longer seeing the floor
 bool s1_is_open(float d) {
     return (d < 0.0f || d > S1_OPEN_AIR);
 }
 
-// Returns true if sensor 2 (forward) is seeing open air
 bool s2_is_open(float d) {
     return (d < 0.0f || d > S2_OPEN_AIR);
 }
 
-// Returns true if both sensors are reading normal (cane upright)
 bool cane_is_upright(float d1, float d2) {
     return !s1_is_open(d1) && !s2_is_open(d2);
 }
 
 // ─────────────────────────────────────────
-// FALL + UPRIGHT DETECTION
+// FALL + UPRIGHT STATE MACHINE
 //
 // Returns:
-//    1  — fall confirmed (either sensor open air for FALL_CONFIRM reads)
-//   -1  — upright confirmed (both normal for UPRIGHT_CONFIRM reads)
-//         only meaningful while assist_mode is active
-//    0  — no state change
+//    1  — fall confirmed
+//   -1  — upright confirmed (clears assist_mode)
+//    0  — no change
 // ─────────────────────────────────────────
-int detect_fall_state(float d1, float d2) {
+int detect_fall_state(float d_fwd, float d_down) {
     static int fall_count    = 0;
     static int upright_count = 0;
 
-    bool open    = s1_is_open(d1) || s2_is_open(d2);
-    bool upright = cane_is_upright(d1, d2);
+    bool open    = s1_is_open(d_fwd) || s2_is_open(d_down);
+    bool upright = cane_is_upright(d_fwd, d_down);
 
     if (open) {
         fall_count++;
@@ -262,7 +258,6 @@ int detect_fall_state(float d1, float d2) {
         upright_count++;
         fall_count = 0;
     } else {
-        // Ambiguous reading — decay both slowly
         if (fall_count    > 0) fall_count--;
         if (upright_count > 0) upright_count--;
     }
@@ -289,12 +284,12 @@ int main(void) {
     audio->CONTROL = 0xC;
     audio->CONTROL = 0x0;
 
-    // Sensor 1: top, pointing down — floor/ledge
+    // Sensor 1: forward (trig=bit5, echo=bit6)
     HCSR04_t sensor1 = { jp2, 5, 6 };
     pinMode(jp2, sensor1.trig_pin, 1);
     pinMode(jp2, sensor1.echo_pin, 0);
 
-    // Sensor 2: side, pointing forward — obstacle/fall
+    // Sensor 2: downward (trig=bit3, echo=bit4)
     HCSR04_t sensor2 = { jp2, 3, 4 };
     pinMode(jp2, sensor2.trig_pin, 1);
     pinMode(jp2, sensor2.echo_pin, 0);
@@ -308,24 +303,21 @@ int main(void) {
     int assist_mode = 0;
 
     while (1) {
-        // ── Read sensors ─────────────────────────────────────────────────
-        float dist_down = distance_read(&sensor1);
+        float dist_fwd  = distance_read(&sensor1);
         delay_us(500);
-        float dist_fwd  = distance_read(&sensor2);
+        float dist_down = distance_read(&sensor2);
         delay_us(500);
 
         // ── Fall / upright state machine ─────────────────────────────────
-        int state = detect_fall_state(dist_down, dist_fwd);
+        int state = detect_fall_state(dist_fwd, dist_down);
 
         if (state == 1 && !assist_mode) {
-            // ── Fall detected ─────────────────────────────────────────────
             assist_mode = 1;
             show_fall();
             play_emergency_siren(0x3FFFFFFF);
             play_emergency_siren(0x3FFFFFFF);
         }
         else if (state == -1 && assist_mode) {
-            // ── Cane back upright — auto-clear fall alert ─────────────────
             assist_mode = 0;
             show_disengage();
             delay_us(1000000);
@@ -333,18 +325,18 @@ int main(void) {
             *hex54 = 0x00000000;
         }
 
-        // ── Normal operation (outside assist mode) ───────────────────────
+        // ── Normal operation ─────────────────────────────────────────────
         if (!assist_mode) {
 
-            // HEX5-HEX3 = down distance, HEX2-HEX0 = forward distance
-            if (dist_down < 0) display_error1();
-            else               display_distance1((int)dist_down);
+            if (dist_fwd  < 0) display_error1();
+            else               display_distance1((int)dist_fwd);
 
-            if (dist_fwd  < 0) display_error2();
-            else               display_distance2((int)dist_fwd);
+            if (dist_down < 0) display_error2();
+            else               display_distance2((int)dist_down);
 
-            // ── Ledge / drop (sensor 1, down) ────────────────────────────
-            // Fires when floor reading rises above normal ~5 cm baseline.
+            // ── Ledge / drop (sensor 2, down) ────────────────────────────
+            // All thresholds are relative to MOUNT_HEIGHT so you only
+            // need to change one number at the top of this file.
             if (dist_down >= LEDGE_DANGER) {
                 play_emergency_siren(0x3FFFFFFF);
             } else if (dist_down >= LEDGE_WARN_HIGH) {
@@ -355,9 +347,7 @@ int main(void) {
                 play_ledge_alert(0x3FFFFFFF / 4);
             }
 
-            // ── Obstacle (sensor 2, forward) ─────────────────────────────
-            // Only alert on close readings — ignore open air
-            // (open air is handled by fall detection, not here)
+            // ── Obstacle (sensor 1, forward) ─────────────────────────────
             if (dist_fwd > 0.0f && dist_fwd <= 100.0f) {
                 unsigned int vol;
                 if      (dist_fwd > 60) vol = 0x3FFFFFFF / 4;
