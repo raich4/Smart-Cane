@@ -1,36 +1,3 @@
-/*******************************************************************************
- * Assistive cane — DE1-SoC bare-metal
- *
- * Device mounted 10–15 cm above floor at base of cane.
- * Set MOUNT_HEIGHT to your actual measured value.
- *
- * Sensor roles:
- *   Sensor 1 — pointing FORWARD (trig=bit5, echo=bit6)
- *       Obstacle detection only. Not used for fall detection.
- *
- *   Sensor 2 — pointing DOWN (trig=bit3, echo=bit4)
- *       Ledge detection + fall detection.
- *
- * Fall vs ledge discrimination (sensor 2):
- *
- *   LEDGE:    dist rises above ledge threshold, then returns to baseline
- *             within LEDGE_RETURN_WINDOW iterations. Transient event.
- *
- *   FAST FALL: dist rises above S2_OPEN_AIR with high velocity
- *             (large jump per iteration) AND stays there.
- *
- *   SLOW FALL: dist rises above S2_OPEN_AIR slowly (low velocity per
- *             iteration) AND stays there beyond SLOW_FALL_SUSTAIN iterations.
- *
- *   Key rule: if dist ever returns to baseline → was a ledge, reset everything.
- *
- * JP2 pin mapping:
- *   bit 3 — sensor 2 TRIG  (output)
- *   bit 4 — sensor 2 ECHO  (input)
- *   bit 5 — sensor 1 TRIG  (output)
- *   bit 6 — sensor 1 ECHO  (input)
- ******************************************************************************/
-
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -40,43 +7,19 @@
 #define AUDIO_BASE      0xFF203040
 #define SAMPLE_RATE     8000
 
-// ── SET THIS first ───────────────────────────────────────────────────────────
-// Hold cane upright on flat ground, read sensor 2 off the HEX display.
-#define MOUNT_HEIGHT        12.0f   // cm
+#define MOUNT_HEIGHT        12.0f
 
-// ── Ledge thresholds (relative to mount height) ──────────────────────────────
 #define LEDGE_WARN_LOW      (MOUNT_HEIGHT + 3.0f)
 #define LEDGE_WARN_MID      (MOUNT_HEIGHT + 6.0f)
 #define LEDGE_WARN_HIGH     (MOUNT_HEIGHT + 10.0f)
 #define LEDGE_DANGER        (MOUNT_HEIGHT + 15.0f)
 
-// ── Fall detection thresholds ─────────────────────────────────────────────────
-
-// Above this = cane is tipped / no floor visible
 #define S2_OPEN_AIR         (MOUNT_HEIGHT + 25.0f)
-
-// Velocity: change per iteration that counts as "fast"
-// Each loop iteration ≈ 1–2 ms. A sharp fall tips the cane in <100 ms
-// so dist_down can jump 20+ cm in just a few reads.
-#define FAST_FALL_VELOCITY  15.0f   // cm per iteration
-
-// How many iterations the signal must stay above S2_OPEN_AIR
-// before a slow fall is confirmed (filters out ledges that don't return)
+#define FAST_FALL_VELOCITY  15.0f
 #define SLOW_FALL_SUSTAIN   12
-
-// If dist returns to within this margin of MOUNT_HEIGHT → was a ledge, reset
 #define BASELINE_MARGIN     (MOUNT_HEIGHT + 4.0f)
-
-// How many iterations to wait for a return before declaring slow fall
-// (a very deep drop might never return during a ledge crossing)
 #define LEDGE_RETURN_WINDOW 8
 
-// Consecutive normal reads to auto-clear fall alert (uprighting)
-#define UPRIGHT_CONFIRM     5
-
-// ─────────────────────────────────────────
-// PERIPHERAL STRUCTS
-// ─────────────────────────────────────────
 typedef struct {
     volatile unsigned int CONTROL;
     volatile unsigned int FIFOSPACE;
@@ -95,6 +38,11 @@ typedef struct {
     int     echo_pin;
 } HCSR04_t;
 
+typedef struct {
+    GPIO_t *gpio;
+    int     pin;
+} VIBRATION_t;
+
 AUDIO_t      *audio = (AUDIO_t *)AUDIO_BASE;
 volatile int *hex   = (volatile int *)HEX3_HEX0_BASE;
 volatile int *hex54 = (volatile int *)HEX5_HEX4_BASE;
@@ -105,9 +53,7 @@ const unsigned char seg7[] = {
     0x6D, 0x7D, 0x07, 0x7F, 0x6F
 };
 
-// ─────────────────────────────────────────
-// GPIO
-// ─────────────────────────────────────────
+// GPIO FUNCTIONS
 void pinMode(GPIO_t *gpio, int pin, int mode) {
     if (mode == 1) gpio->DDR |=  (1 << pin);
     else           gpio->DDR &= ~(1 << pin);
@@ -127,9 +73,7 @@ void delay_us(int us) {
     for (i = 0; i < us * 40; i++);
 }
 
-// ─────────────────────────────────────────
 // HEX DISPLAY
-// ─────────────────────────────────────────
 void display_distance1(int cm) {
     if (cm > 999) cm = 999;
     if (cm < 0)   cm = 0;
@@ -161,9 +105,13 @@ void show_fall(void) {
 }
 
 void show_slow_fall(void) {
-    // "SLO" across HEX5-HEX3
     *hex54 = (0x6D << 8) | 0x38;
     *hex   = (*hex & 0x00FFFFFF) | (0x3F << 24);
+}
+
+void show_assist(void) {
+    *hex54 = 0x00000000;
+    *hex   = (0x77 << 24) | (0x6D << 16) | (0x6D << 8) | 0x78;
 }
 
 void show_disengage(void) {
@@ -171,9 +119,7 @@ void show_disengage(void) {
     *hex   = (0x5E << 24) | (0x06 << 16) | (0x6D << 8) | 0x79;
 }
 
-// ─────────────────────────────────────────
-// AUDIO
-// ─────────────────────────────────────────
+// AUDIO FUNCTIONS
 static bool FIFOspace(void) {
     unsigned int fs = audio->FIFOSPACE;
     return ((fs >> 24) & 0xFF) > 0 && ((fs >> 16) & 0xFF) > 0;
@@ -216,7 +162,6 @@ void play_emergency_siren(int vol) {
     play_tone(800, 300, vol);
 }
 
-// Slower, more insistent tone for slow fall — distinct from fast fall siren
 void play_slow_fall_alert(int vol) {
     play_tone(500, 500, vol);
     play_tone(0,   150, vol);
@@ -224,9 +169,32 @@ void play_slow_fall_alert(int vol) {
     play_tone(0,   150, vol);
 }
 
-// ─────────────────────────────────────────
+// VIBRATION FUNCTIONS
+int vibrationRead(VIBRATION_t *vib) {
+    return digitalRead(vib->gpio, vib->pin);
+}
+
+int countTaps(GPIO_t *gpio, int pin) {
+    int count   = 1;
+    int timeout = 0;
+
+    while(digitalRead(gpio, pin));
+    delay_us(10000);
+
+    while(timeout < 8000) {
+        if(digitalRead(gpio, pin)) {
+            count++;
+            while(digitalRead(gpio, pin));
+            delay_us(10000);
+            timeout = 0;
+        }
+        delay_us(100);
+        timeout++;
+    }
+    return count;
+}
+
 // HC-SR04
-// ─────────────────────────────────────────
 float distance_read(HCSR04_t *s) {
     digitalWrite(s->gpio, s->trig_pin, 0);
     delay_us(2);
@@ -246,54 +214,32 @@ float distance_read(HCSR04_t *s) {
     return (float)count / 150.0f;
 }
 
-// ─────────────────────────────────────────
-// FALL VS LEDGE STATE MACHINE  (sensor 2 only)
-//
-// States:
-//   NORMAL     — baseline reading, nothing happening
-//   ELEVATED   — above ledge threshold, waiting to see if it returns
-//   OPEN_AIR   — above S2_OPEN_AIR, timing sustain to distinguish fall/ledge
-//
-// Returns:
-//    0  — nothing / ledge (handled separately in main)
-//    1  — fast fall confirmed
-//    2  — slow fall confirmed
-//   -1  — uprighted (clears assist_mode)
-// ─────────────────────────────────────────
+// FALL STATE MACHINE
 typedef enum { STATE_NORMAL, STATE_ELEVATED, STATE_OPEN_AIR } FallState;
 
 int detect_fall_state(float d_down) {
-    static FallState state        = STATE_NORMAL;
-    static float     prev_d       = -1.0f;
+    static FallState state         = STATE_NORMAL;
+    static float     prev_d        = -1.0f;
     static int       sustain_count = 0;
     static int       return_timer  = 0;
-    static int       upright_count = 0;
 
-    // First call — just initialise
     if (prev_d < 0.0f) {
         prev_d = (d_down >= 0.0f) ? d_down : MOUNT_HEIGHT;
         return 0;
     }
 
-    // Handle bad read — treat as open air
-    float d = (d_down < 0.0f) ? (S2_OPEN_AIR + 10.0f) : d_down;
-
-    float velocity = d - prev_d;   // positive = moving away from floor
+    float d        = (d_down < 0.0f) ? (S2_OPEN_AIR + 10.0f) : d_down;
+    float velocity = d - prev_d;
     prev_d = d;
 
     switch (state) {
-
         case STATE_NORMAL:
-            upright_count = 0;
             if (d > S2_OPEN_AIR) {
-                // Jumped straight to open air
                 sustain_count = 1;
                 return_timer  = 0;
                 state = STATE_OPEN_AIR;
-
-                // Fast fall: high velocity straight into open air
                 if (velocity >= FAST_FALL_VELOCITY) {
-                    state         = STATE_NORMAL;   // reset — main will set assist_mode
+                    state         = STATE_NORMAL;
                     sustain_count = 0;
                     prev_d        = MOUNT_HEIGHT;
                     return 1;
@@ -306,15 +252,12 @@ int detect_fall_state(float d_down) {
 
         case STATE_ELEVATED:
             if (d <= BASELINE_MARGIN) {
-                // Returned to baseline — was a ledge crossing, reset
                 state        = STATE_NORMAL;
                 return_timer = 0;
             } else if (d > S2_OPEN_AIR) {
-                // Escalated to open air from elevated
                 sustain_count = 1;
                 return_timer  = 0;
                 state         = STATE_OPEN_AIR;
-
                 if (velocity >= FAST_FALL_VELOCITY) {
                     state         = STATE_NORMAL;
                     sustain_count = 0;
@@ -322,11 +265,8 @@ int detect_fall_state(float d_down) {
                     return 1;
                 }
             } else {
-                // Still elevated but not open air — ledge crossing in progress
                 return_timer++;
                 if (return_timer > LEDGE_RETURN_WINDOW) {
-                    // Stayed elevated too long without returning — treat as
-                    // very slow fall onset, escalate to open air monitoring
                     state         = STATE_OPEN_AIR;
                     sustain_count = return_timer;
                     return_timer  = 0;
@@ -336,23 +276,17 @@ int detect_fall_state(float d_down) {
 
         case STATE_OPEN_AIR:
             if (d <= BASELINE_MARGIN) {
-                // Returned to baseline — cane back upright, was a ledge or
-                // person picked up the cane
                 state         = STATE_NORMAL;
                 sustain_count = 0;
                 return_timer  = 0;
             } else if (d > S2_OPEN_AIR) {
                 sustain_count++;
-
-                // Fast fall: high velocity while already in open air
                 if (velocity >= FAST_FALL_VELOCITY) {
                     state         = STATE_NORMAL;
                     sustain_count = 0;
                     prev_d        = MOUNT_HEIGHT;
                     return 1;
                 }
-
-                // Slow fall: sustained open air without returning
                 if (sustain_count >= SLOW_FALL_SUSTAIN) {
                     state         = STATE_NORMAL;
                     sustain_count = 0;
@@ -360,10 +294,8 @@ int detect_fall_state(float d_down) {
                     return 2;
                 }
             } else {
-                // Between baseline and open air — decaying back, likely ledge
                 return_timer++;
                 if (return_timer > LEDGE_RETURN_WINDOW) {
-                    // Lingered in middle zone too long — slow fall
                     state         = STATE_NORMAL;
                     sustain_count = 0;
                     return_timer  = 0;
@@ -373,40 +305,27 @@ int detect_fall_state(float d_down) {
             break;
     }
 
-    // Uprighting detection: only meaningful while assist_mode is active
-    // (checked in main before calling this)
-    if (d <= BASELINE_MARGIN) {
-        upright_count++;
-        if (upright_count >= UPRIGHT_CONFIRM) {
-            upright_count = 0;
-            state         = STATE_NORMAL;
-            sustain_count = 0;
-            return_timer  = 0;
-            return -1;
-        }
-    } else {
-        upright_count = 0;
-    }
-
     return 0;
 }
 
-// ─────────────────────────────────────────
 // MAIN
-// ─────────────────────────────────────────
 int main(void) {
     audio->CONTROL = 0xC;
     audio->CONTROL = 0x0;
 
-    // Sensor 1: forward (trig=bit5, echo=bit6)
+    // sensor 1: forward (trig=bit5, echo=bit6)
     HCSR04_t sensor1 = { jp2, 5, 6 };
     pinMode(jp2, sensor1.trig_pin, 1);
     pinMode(jp2, sensor1.echo_pin, 0);
 
-    // Sensor 2: downward (trig=bit3, echo=bit4)
+    // sensor 2: downward (trig=bit3, echo=bit4)
     HCSR04_t sensor2 = { jp2, 3, 4 };
     pinMode(jp2, sensor2.trig_pin, 1);
     pinMode(jp2, sensor2.echo_pin, 0);
+
+    // vibration: pin 5 (bit2)
+    VIBRATION_t vib = { jp2, 2 };
+    pinMode(jp2, vib.pin, 0);
 
     digitalWrite(jp2, sensor1.trig_pin, 0);
     digitalWrite(jp2, sensor2.trig_pin, 0);
@@ -422,59 +341,64 @@ int main(void) {
         float dist_down = distance_read(&sensor2);
         delay_us(500);
 
-        // ── Fall detection ────────────────────────────────────────────────
-        int state = detect_fall_state(dist_down);
+        // --- VIBRATION TAP CHECK ---
+        if(vibrationRead(&vib)) {
+            int taps = countTaps(jp2, 2);
 
-        if (!assist_mode) {
-            if (state == 1) {
-                // Fast fall
+            if(taps == 1 && !assist_mode) {
+                // manual assistance call
+                assist_mode = 1;
+                show_assist();
+                play_emergency_siren(0x3FFFFFFF);
+            }
+            else if(taps >= 3 && assist_mode) {
+                // disarm assistance
+                assist_mode = 0;
+                show_disengage();
+                delay_us(1000000);
+                *hex   = 0x00000000;
+                *hex54 = 0x00000000;
+            }
+        }
+
+        // --- FALL DETECTION ---
+        int fall_state = detect_fall_state(dist_down);
+
+        if(!assist_mode) {
+            if(fall_state == 1) {
                 assist_mode = 1;
                 show_fall();
                 play_emergency_siren(0x3FFFFFFF);
                 play_emergency_siren(0x3FFFFFFF);
             }
-            else if (state == 2) {
-                // Slow fall
+            else if(fall_state == 2) {
                 assist_mode = 1;
                 show_slow_fall();
                 play_slow_fall_alert(0x3FFFFFFF);
                 play_slow_fall_alert(0x3FFFFFFF);
             }
         }
-        else if (state == -1) {
-            // Cane uprighted — auto-clear
-            assist_mode = 0;
-            show_disengage();
-            delay_us(1000000);
-            *hex   = 0x00000000;
-            *hex54 = 0x00000000;
-        }
 
-        // ── Normal operation ─────────────────────────────────────────────
-        if (!assist_mode) {
+        // --- NORMAL OPERATION ---
+        if(!assist_mode) {
+            if(dist_fwd  < 0) display_error1();
+            else              display_distance1((int)dist_fwd);
 
-            if (dist_fwd  < 0) display_error1();
-            else               display_distance1((int)dist_fwd);
+            if(dist_down < 0) display_error2();
+            else              display_distance2((int)dist_down);
 
-            if (dist_down < 0) display_error2();
-            else               display_distance2((int)dist_down);
-
-            // ── Ledge / drop (sensor 2) ───────────────────────────────────
-            // These fire during STATE_ELEVATED — before it escalates to
-            // STATE_OPEN_AIR — giving the user a warning as the cane
-            // approaches a drop. Falls are handled above separately.
-            if (dist_down >= LEDGE_DANGER) {
+            // ledge detection sensor 2
+            if(dist_down >= LEDGE_DANGER)
                 play_emergency_siren(0x3FFFFFFF);
-            } else if (dist_down >= LEDGE_WARN_HIGH) {
+            else if(dist_down >= LEDGE_WARN_HIGH)
                 play_ledge_alert(0x3FFFFFFF);
-            } else if (dist_down >= LEDGE_WARN_MID) {
+            else if(dist_down >= LEDGE_WARN_MID)
                 play_ledge_alert(0x3FFFFFFF / 2);
-            } else if (dist_down >= LEDGE_WARN_LOW) {
+            else if(dist_down >= LEDGE_WARN_LOW)
                 play_ledge_alert(0x3FFFFFFF / 4);
-            }
 
-            // ── Obstacle (sensor 1) ───────────────────────────────────────
-            if (dist_fwd > 0.0f && dist_fwd <= 100.0f) {
+            // obstacle detection sensor 1
+            if(dist_fwd > 0.0f && dist_fwd <= 100.0f) {
                 unsigned int vol;
                 if      (dist_fwd > 60) vol = 0x3FFFFFFF / 4;
                 else if (dist_fwd > 30) vol = 0x3FFFFFFF / 2;
