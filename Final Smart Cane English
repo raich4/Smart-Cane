@@ -24,9 +24,9 @@
 #define AUDIO_WAIT_LIMIT 200000
 #define AUDIO_RESET_DELAY 2000
 
-#define MOUNT_HEIGHT 5.0f
-#define LEDGE_WARN_LOW (MOUNT_HEIGHT + 3.0f)
-#define LEDGE_WARN_MID (MOUNT_HEIGHT + 6.0f)
+#define MOUNT_HEIGHT 10.0f
+#define LEDGE_WARN_LOW (MOUNT_HEIGHT + 5.0f)
+#define LEDGE_WARN_MID (MOUNT_HEIGHT + 8.0f)
 #define LEDGE_WARN_HIGH (MOUNT_HEIGHT + 10.0f)
 #define LEDGE_DANGER (MOUNT_HEIGHT + 15.0f)
 #define S2_OPEN_AIR (MOUNT_HEIGHT + 25.0f)
@@ -688,7 +688,7 @@ int main(void) {
     if (!assist_mode) {
       int fall_state = detect_fall_state(dist_down);
 
-      if (fall_state == 1) {
+      if (fall_state == 1|| fall_state == 2) {
         int i;
         assist_mode = 1;
         current_alert_state = 4;
@@ -742,11 +742,11 @@ int main(void) {
         }
       }
 
-      if (dist_fwd > 0.0f && dist_fwd <= 100.0f) {
+      if (dist_fwd > 0.0f && dist_fwd <= 30.0f) {
         int vs;
-        if (dist_fwd > 60)
+        if (dist_fwd > 15)
           vs = 2;
-        else if (dist_fwd > 30)
+        else if (dist_fwd > 8)
           vs = 1;
         else
           vs = 0;
